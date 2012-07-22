@@ -58,6 +58,27 @@ class Instagram {
   private $_accesstoken;
 
   /**
+   * Should we cache results?
+   * 
+   * @var boolean
+   */
+  private $_docache = FALSE;
+
+  /**
+   * Number of seconds to hold on to cache
+   * 
+   * @var integer
+   */
+  private $_cacheexpire = 3600;
+
+  /**
+   * Where cache files are stored
+   * 
+   * @var string
+   */
+  private $_cachedir;
+
+  /**
    * Available scopes
    * 
    * @var array
@@ -84,6 +105,9 @@ class Instagram {
       $this->setApiKey($config['apiKey']);
       $this->setApiSecret($config['apiSecret']);
       $this->setApiCallback($config['apiCallback']);
+	  if(isset($config['cacheResults'])) $this->_docache = (bool) @$config['cacheResults'];
+	  if(isset($config['cacheExpire'])) $this->_cacheexpire = (int) $config['cacheExpire'];
+	  $this->_cachedir = isset($config['cacheDir']) ? $config['cacheDir'] : WP_CONTENT_DIR.'/instagram_cache/';
     } else if (true === is_string($config)) {
       // if you only want to access public data
       $this->setApiKey($config);
@@ -211,10 +235,11 @@ class Instagram {
    *
    * @param string $lat                   Latitude of the center search coordinate
    * @param string $lng                   Longitude of the center search coordinate
+   * @param integer $distance			  Distance (in meters...radial(?)) from lat & log coords
    * @return mixed
    */
-  public function searchMedia($lat, $lng) {
-    return $this->_makeCall('media/search', false, array('lat' => $lat, 'lng' => $lng));
+  public function searchMedia($lat, $lng, $distance=1000) {
+    return $this->_makeCall('media/search', false, array('lat' => $lat, 'lng' => $lng, 'distance' => $distance));
   }
 
   /**
@@ -296,6 +321,7 @@ class Instagram {
    * @return mixed
    */
   private function _makeCall($function, $auth = false, $params = null, $method = 'GET') {
+	
     if (false === $auth) {
       // if the call doesn't requires authentication
       $authMethod = '?client_id=' . $this->getApiKey();
@@ -315,22 +341,67 @@ class Instagram {
     }
     
     $apiCall = self::API_URL . $function . $authMethod . (('GET' === $method) ? $paramString : null);
-    
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $apiCall);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, array('Accept: application/json'));
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
-    
-    if ('POST' === $method) {
-      curl_setopt($ch, CURLOPT_POST, count($params));
-      curl_setopt($ch, CURLOPT_POSTFIELDS, ltrim($paramString, '&'));
-    }
-    
-    $jsonData = curl_exec($ch);
-    curl_close($ch);
-    
-    return json_decode($jsonData);
+
+	// Before we attempt a call, should we try to pull it from cache?
+	if($this->_docache === TRUE) {
+
+		// Ensure the cache directory exists and writable
+		if(!is_dir($this->_cachedir) || !is_writable($this->_cachedir)) {
+			@mkdir($this->_cachedir);
+			@chmod($this->_cachedir, 0777);
+			// If we still don't have a writable dir, then no cache
+			if(!is_writable($this->_cachedir)) $this->_docache = FALSE;
+		}
+
+		// Build the cache file name
+		$cachefile = strtolower($function);
+		if(is_array($params) && count($params)) {
+			foreach($params as $key => $val) {
+				$cachefile .= '_'.strtolower($val);
+			}
+		}
+		$cachefile .= '.txt';
+
+		// Clean up the filename, and build a fully qualified filename
+		$cachefile = preg_replace('/[^0-9a-zA-Z\-\_\.]/', '', str_replace('/', '_', $cachefile));
+		$cachefile = $this->_cachedir.$cachefile;
+	}
+
+	// If the file exists and hasn't expired, then use the cached data
+	if(($this->_docache === TRUE) && file_exists($cachefile) && (filemtime($cachefile) > (time() - $this->_cacheexpire))) {
+
+		// Get the JSON data from the cache file
+		$jsonData = file_get_contents($cachefile);
+
+	}
+
+	// Do the call and store the response
+	else {
+
+		$ch = curl_init();
+		curl_setopt($ch, CURLOPT_URL, $apiCall);
+		curl_setopt($ch, CURLOPT_HTTPHEADER, array('Accept: application/json'));
+		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+		curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+
+		if('POST' === $method) {
+			curl_setopt($ch, CURLOPT_POST, count($params));
+			curl_setopt($ch, CURLOPT_POSTFIELDS, ltrim($paramString, '&'));
+		}
+
+		$jsonData = curl_exec($ch);
+		curl_close($ch);
+		
+		// Store the JSON data in cache
+		if($handle = fopen($cachefile, 'wb+')) {
+			fwrite($handle, $jsonData);
+			fclose($handle);
+		}
+
+	}
+
+	return json_decode($jsonData);
+
   }
 
   /**
